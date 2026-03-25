@@ -1,0 +1,5 @@
+{   "task": { "id": "split"},
+    "file": {
+        "path": "test/broken.pdf"
+    }
+}

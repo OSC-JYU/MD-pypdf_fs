@@ -1,0 +1,7 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+pypdf==3.17.1 
+dotenv==0.9.9
+requests==2.32.3
+Pillow==10.4.0
