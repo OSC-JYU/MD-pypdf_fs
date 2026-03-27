@@ -4,29 +4,22 @@ import os
 from dotenv import load_dotenv
 import json
 import uuid
-import shutil
-import requests
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError, PyPdfError
 import tempfile
-import time
 import logging
 import io
+import shutil
 from typing import Dict, List, Optional, Tuple, Any
 
 from PIL import Image
 
-load_dotenv()
-MD_URL = os.getenv("MD_URL", "http://localhost:8200")
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 MD_PATH_ENV = os.getenv("MD_PATH", "")
 CONTAINER_MODE = os.getenv("CONTAINER", "").strip().lower() in ("1", "true", "yes", "on")
+STORAGE_MODE = (os.getenv("STORAGE_MODE") or os.getenv("FILE_STORAGE_MODE") or "disk").strip().lower()
 
 REQUEST_READ_CHUNK_SIZE = int(os.getenv("REQUEST_READ_CHUNK_SIZE", str(1024 * 1024)))
-CALLBACK_CONNECT_TIMEOUT = float(os.getenv("MD_CALLBACK_CONNECT_TIMEOUT", "3"))
-CALLBACK_READ_TIMEOUT = float(os.getenv("MD_CALLBACK_READ_TIMEOUT", "30"))
-CALLBACK_RETRIES = int(os.getenv("MD_CALLBACK_RETRIES", "3"))
-CALLBACK_RETRY_BACKOFF_SEC = float(os.getenv("MD_CALLBACK_RETRY_BACKOFF_SEC", "1.0"))
-RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 
 DEFAULT_IMAGE_MIN_WIDTH = int(os.getenv("PDF_IMAGE_MIN_WIDTH", "200"))
 DEFAULT_IMAGE_MIN_HEIGHT = int(os.getenv("PDF_IMAGE_MIN_HEIGHT", "200"))
@@ -44,6 +37,9 @@ def log_event(level: str, event: str, **fields):
 
 def resolve_md_root(md_path_env: str, container_mode: bool) -> str:
     """Resolve MessyDesk root that contains data/."""
+    if STORAGE_MODE == "disk" and (not isinstance(md_path_env, str) or not md_path_env.strip()):
+        raise RuntimeError("MD_PATH must be set when STORAGE_MODE=disk")
+
     candidates = []
     if isinstance(md_path_env, str) and md_path_env.strip():
         raw = os.path.abspath(md_path_env.strip())
@@ -105,37 +101,6 @@ def parse_request_payload(raw: bytes) -> Dict:
     return payload
 
 
-def get_db_name_from_file_path(file_path: str) -> str:
-    path_parts = file_path.replace('\\', '/').split('/')
-    if len(path_parts) >= 2 and path_parts[0] == 'data' and path_parts[1]:
-        return path_parts[1]
-    return os.getenv("DB_NAME", "messydesk")
-
-
-def get_project_rid(file_node: dict, source_path: str) -> Optional[str]:
-    rid = file_node.get('project_rid')
-    if isinstance(rid, str) and rid:
-        return rid
-
-    normalized = source_path.replace('\\', '/')
-    marker = '/projects/'
-    if marker not in normalized:
-        return None
-
-    try:
-        segment = normalized.split(marker, 1)[1].split('/', 1)[0]
-    except Exception:
-        return None
-
-    if not segment:
-        return None
-
-    parsed = segment.replace('_', ':')
-    if not parsed.startswith('#'):
-        parsed = '#' + parsed
-    return parsed
-
-
 def callback_enabled(request_json: dict) -> bool:
     return bool(
         isinstance(request_json.get('process'), dict)
@@ -144,70 +109,6 @@ def callback_enabled(request_json: dict) -> bool:
         and request_json.get('userId')
         and request_json.get('output_set')
     )
-
-
-def send_file_to_tmp_endpoint(
-    tmp_relative_path: str,
-    source_file_path: str,
-    original_label: str,
-    project_rid: str,
-    request_json: dict,
-    total_files: int,
-    upload_count: int,
-    output_type: str = "pdf",
-    output_extension: str = "pdf",
-) -> Tuple[Optional[dict], Optional[str]]:
-    """Notify MessyDesk to process file already written under data/<DB_NAME>/tmp."""
-    url = f"{MD_URL}/api/nomad/process/files/tmp"
-    source_file = request_json.get('file', {})
-
-    message = {
-        "file": {
-            "@rid": source_file.get('@rid'),
-            "project_rid": source_file.get('project_rid'),
-            "path": source_file_path,
-            "type": output_type,
-            "extension": output_extension,
-            "label": original_label,
-        },
-        "target": request_json.get('target', project_rid),
-        "process": request_json.get('process'),
-        "output_set": request_json.get('output_set'),
-        "userId": request_json.get('userId'),
-        "total_files": total_files,
-        "current_file": upload_count + 1,
-    }
-
-    payload = {
-        "message": message,
-        "tmp_path": tmp_relative_path,
-    }
-
-    last_error = None
-    for attempt in range(1, CALLBACK_RETRIES + 1):
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=(CALLBACK_CONNECT_TIMEOUT, CALLBACK_READ_TIMEOUT),
-            )
-            if response.status_code == 200:
-                return response.json(), None
-
-            err = f"http_{response.status_code}: {response.text[:300]}"
-            if response.status_code in RETRYABLE_STATUS_CODES and attempt < CALLBACK_RETRIES:
-                time.sleep(CALLBACK_RETRY_BACKOFF_SEC * attempt)
-                continue
-            return None, err
-        except requests.RequestException as err:
-            last_error = str(err)
-            if attempt < CALLBACK_RETRIES:
-                time.sleep(CALLBACK_RETRY_BACKOFF_SEC * attempt)
-                continue
-            break
-
-    return None, (last_error or "callback_request_failed")
 
 
 def infer_output_metadata(output_path: str, default_type: str, default_extension: str) -> Tuple[str, str]:
@@ -220,6 +121,49 @@ def infer_output_metadata(output_path: str, default_type: str, default_extension
     if ext not in {'jpg', 'png'}:
         ext = 'png'
     return 'image', ext
+
+
+def build_disk_response(request_json: dict, output_paths: List[str], default_type: str, default_extension: str) -> dict:
+    source_path = str(request_json.get('file', {}).get('path', ''))
+    db_name = 'messydesk'
+    parts = source_path.replace('\\', '/').split('/')
+    for idx, part in enumerate(parts[:-1]):
+        if part == 'data' and idx + 1 < len(parts) and parts[idx + 1]:
+            db_name = parts[idx + 1]
+            break
+
+    tmp_dir = os.path.join(MD_ROOT, 'data', db_name, 'tmp')
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    files = []
+    for output_path in output_paths:
+        safe_name = os.path.basename(output_path)
+        callback_name = safe_name
+        if os.path.isfile(output_path):
+            target_path = os.path.join(tmp_dir, callback_name)
+            if os.path.abspath(output_path) != os.path.abspath(target_path):
+                if os.path.exists(target_path):
+                    callback_name = f"{uuid.uuid4().hex}_{safe_name}"
+                    target_path = os.path.join(tmp_dir, callback_name)
+                shutil.copy2(output_path, target_path)
+
+        output_type, output_extension = infer_output_metadata(output_path, default_type, default_extension)
+        files.append(
+            {
+                "path": callback_name,
+                "label": safe_name,
+                "type": output_type,
+                "extension": output_extension,
+            }
+        )
+
+    return {
+        "task": request_json.get('task', {}).get('id'),
+        "response": {
+            "type": "disk",
+            "files": files,
+        },
+    }
 
 
 def parse_int_param(params: dict, key: str, default: int, minimum: int = 1) -> int:
@@ -306,11 +250,12 @@ def split_pdf_to_pages(input_file: str) -> Dict[str, Any]:
 
         successful_pages = 0
         page_paths: List[str] = []
+        pad_width = max(3, len(str(page_count)))
         for i, page in enumerate(reader.pages, start=1):
             try:
                 writer = PdfWriter()
                 writer.add_page(page)
-                output_path = os.path.join(output_dir, f"page_{i}.pdf")
+                output_path = os.path.join(output_dir, f"page_{i:0{pad_width}d}.pdf")
                 with open(output_path, "wb") as f:
                     writer.write(f)
                 successful_pages += 1
@@ -499,17 +444,16 @@ async def root():
 
 @app.post("/process")
 async def process_files(
-    request: UploadFile = File(...)
+    message: UploadFile = File(...)
 ):
-    start_time = time.time()
     input_file = None
     try:
         log_event("info", "process_start")
 
-        # Read request JSON in-memory to avoid disk roundtrip overhead.
+        # Read message JSON in-memory to avoid disk roundtrip overhead.
         request_chunks = []
         while True:
-            chunk = await request.read(REQUEST_READ_CHUNK_SIZE)
+            chunk = await message.read(REQUEST_READ_CHUNK_SIZE)
             if not chunk:
                 break
             request_chunks.append(chunk)
@@ -558,49 +502,6 @@ async def process_files(
         else:
             raise HTTPException(400, f"Unsupported task: {task_id}")
 
-        callback_success = 0
-        callback_failed = 0
-        if callback_enabled(request_json):
-            source_file = request_json.get('file', {})
-            project_rid = get_project_rid(source_file, source_file.get('path', ''))
-            if not project_rid:
-                raise HTTPException(400, "Could not determine project_rid from message or file path")
-
-            db_name = get_db_name_from_file_path(source_file.get('path', ''))
-            tmp_root = os.path.join(MD_ROOT, "data", db_name, "tmp")
-            os.makedirs(tmp_root, exist_ok=True)
-
-            if not isinstance(output_paths, list):
-                output_paths = []
-            total_files = len(output_paths)
-            for index, output_path in enumerate(output_paths, start=1):
-                safe_name = os.path.basename(output_path)
-                tmp_filename = f"pdfsplit_{uuid.uuid4().hex}_{safe_name}"
-                staged_path = os.path.join(tmp_root, tmp_filename)
-                shutil.copyfile(output_path, staged_path)
-                callback_type, callback_extension = infer_output_metadata(output_path, output_type, output_extension)
-
-                callback_response, callback_error = send_file_to_tmp_endpoint(
-                    tmp_filename,
-                    staged_path,
-                    safe_name,
-                    project_rid,
-                    request_json,
-                    total_files,
-                    index - 1,
-                    output_type=callback_type,
-                    output_extension=callback_extension,
-                )
-                if callback_response:
-                    callback_success += 1
-                else:
-                    callback_failed += 1
-                    log_event("warning", "tmp_callback_failed", file=safe_name, error=callback_error)
-
-                if os.path.exists(staged_path):
-                    os.remove(staged_path)
-
-        end_time = time.time()
         log_event(
             "info",
             "process_summary",
@@ -608,15 +509,11 @@ async def process_files(
             input_file=input_file,
             page_count=result["page_count"],
             successful_pages=result["successful_pages"],
-            duration_sec=round(end_time - start_time, 3),
         )
-        return {
-            "page_count": result["page_count"],
-            "successful_pages": result["successful_pages"],
-            "callback_success": callback_success,
-            "callback_failed": callback_failed,
-            "execution_time": round(end_time - start_time, 1)
-        }
+        response = build_disk_response(request_json, output_paths, output_type, output_extension)
+        response["page_count"] = result["page_count"]
+        response["successful_pages"] = result["successful_pages"]
+        return response
     except HTTPException:
         raise
     except Exception as err:
@@ -629,7 +526,6 @@ if __name__ == "__main__":
     log_event(
         "info",
         "service_start",
-        md_url=MD_URL,
         md_path_env=MD_PATH_ENV,
         container_mode=CONTAINER_MODE,
         md_root=MD_ROOT,

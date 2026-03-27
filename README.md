@@ -11,7 +11,7 @@ It reads and writes directly under MessyDesk file storage (`_fs`).
 
 - `split`: split a PDF into one-page PDF files under `pages/page_N.pdf`.
 - `extract_text`: extract each page text to `pages/<pdf_label>_page_N.pdf.txt`.
-	- Single-page input keeps original page label, for example `page_12.pdf` -> `page_12.pdf.txt`.
+	- Single-page input keeps original page label, for example `page_001.pdf` -> `page_001.pdf.txt`.
 - `extract_images`: extract embedded PDF images to `pages/<pdf_label>_page_N_image_M.jpg|png`.
 	- Small or extreme-aspect-ratio images are skipped by default.
 
@@ -49,7 +49,7 @@ Endpoint:
 
 - `http://localhost:9002/process`
 
-Payload is queue message as multipart file field `request` containing JSON.
+Payload is queue message as multipart file field `message` containing JSON.
 
 ## Running as service
 
@@ -57,6 +57,8 @@ Create `.env` file with:
 
 	MD_PATH="/home/YOUR_USERNAME/Projects/MessyDesk"
 	MD_URL="http://localhost:8200"
+
+Service loads `.env` automatically on startup.
 
 ### Run with python
 
@@ -87,7 +89,7 @@ Or directly:
 Run these from `MD-pdf-splitter_fs` directory:
 
 	curl -X POST -H "Content-Type: multipart/form-data" \
-	  -F "request=@test/split.json;type=application/json" \
+	-F "message=@test/split.json;type=application/json" \
 	  http://localhost:9002/process
 
 ## Config
@@ -98,6 +100,10 @@ Required:
 	- local Python run (host): `MD_PATH=/home/<user>/Projects/MessyDesk`
 	- container run: `MD_PATH=/app`
 - `CONTAINER`: set `CONTAINER=true` when running in container
+
+Important:
+- When `STORAGE_MODE=disk` (or `FILE_STORAGE_MODE=disk`), `MD_PATH` must be set.
+- Disk responses use filename-only `response.files[].path` values (no absolute path).
 
 Path notes:
 
@@ -112,6 +118,29 @@ Optional:
 - `PDF_IMAGE_MIN_WIDTH` (default `200`)
 - `PDF_IMAGE_MIN_HEIGHT` (default `200`)
 - `PDF_IMAGE_MAX_ASPECT_RATIO` (default `8.0`)
+
+## Disk response contract
+
+Example:
+
+```json
+{
+	"task": "split",
+	"response": {
+		"type": "disk",
+		"files": [
+			{
+				"path": "page_001.pdf",
+				"label": "page_001.pdf",
+				"type": "pdf",
+				"extension": "pdf"
+			}
+		]
+	}
+}
+```
+
+Adapter (`elg_fs`) sends one `/tmp` callback per file using filename-only `tmp_path`.
 
 
 
