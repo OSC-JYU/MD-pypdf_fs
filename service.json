@@ -1,0 +1,66 @@
+{
+  "local_url": "http://localhost:9002",
+  "id": "md-pypdf_fs",
+  "type": "pypdf",
+  "api_type": "elg",
+  "adapter": "elg_fs",
+  "category": "system",
+  "api": "/process",
+  "name": "PyPDF",
+  "supported_types": [
+    "pdf"
+  ],
+  "supported_formats": [
+    "pdf"
+  ],
+  "description": "PyPDF file processing for split, text extraction, and embedded image extraction",
+  "tasks": {
+    "split": {
+      "params": {
+        "task": "split"
+      },
+      "output_set": "PDF pages",
+      "name": "Split PDF to pages",
+      "description": "Split an input PDF into one-page PDF files",
+      "behaviour": "one-to-many"
+    },
+    "extract_text": {
+      "params": {
+        "task": "extract_text"
+      },
+      "output_set": "PDF text pages",
+      "name": "Extract text from PDF",
+      "description": "Extract page text and produce one text file per page",
+      "behaviour": "one-to-many"
+    },
+    "extract_images": {
+      "params": {
+        "task": "extract_images",
+        "min_width": 200,
+        "min_height": 200,
+        "max_aspect_ratio": 8.0
+      },
+      "params_help": {
+        "min_width": {
+          "name": "min_width",
+          "help": "Minimum image width in pixels",
+          "display": "number"
+        },
+        "min_height": {
+          "name": "min_height",
+          "help": "Minimum image height in pixels",
+          "display": "number"
+        },
+        "max_aspect_ratio": {
+          "name": "max_aspect_ratio",
+          "help": "Maximum allowed width/height or height/width ratio",
+          "display": "number"
+        }
+      },
+      "output_set": "PDF extracted images",
+      "name": "Extract embedded images",
+      "description": "Extract embedded images from PDF pages with optional size/aspect filtering",
+      "behaviour": "one-to-many"
+    }
+  }
+}

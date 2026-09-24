@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 import os
 from dotenv import load_dotenv
 import json
@@ -10,6 +11,7 @@ import tempfile
 import logging
 import io
 import shutil
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 from PIL import Image
@@ -20,6 +22,14 @@ CONTAINER_MODE = os.getenv("CONTAINER", "").strip().lower() in ("1", "true", "ye
 STORAGE_MODE = (os.getenv("STORAGE_MODE") or os.getenv("FILE_STORAGE_MODE") or "disk").strip().lower()
 
 REQUEST_READ_CHUNK_SIZE = int(os.getenv("REQUEST_READ_CHUNK_SIZE", str(1024 * 1024)))
+
+SERVICE_DESCRIPTOR_PATH = Path(os.getenv("SERVICE_DESCRIPTOR_PATH", "./service.json")).resolve()
+SERVICE_HELP_PATH = Path(os.getenv("SERVICE_HELP_PATH", "./help/index.md")).resolve()
+SERVICE_HELP_FALLBACK_PATH = Path(os.getenv("SERVICE_HELP_FALLBACK_PATH", "./README.md")).resolve()
+SERVICE_ID_OVERRIDE = os.getenv("SERVICE_ID")
+SERVICE_NAME_OVERRIDE = os.getenv("SERVICE_NAME")
+SERVICE_ADAPTER_OVERRIDE = os.getenv("SERVICE_ADAPTER")
+SERVICE_LOCAL_URL_OVERRIDE = os.getenv("SERVICE_LOCAL_URL")
 
 DEFAULT_IMAGE_MIN_WIDTH = int(os.getenv("PDF_IMAGE_MIN_WIDTH", "200"))
 DEFAULT_IMAGE_MIN_HEIGHT = int(os.getenv("PDF_IMAGE_MIN_HEIGHT", "200"))
@@ -182,6 +192,46 @@ def parse_float_param(params: dict, key: str, default: float, minimum: float = 1
         return parsed if parsed >= minimum else default
     except (TypeError, ValueError):
         return default
+
+
+def apply_service_descriptor_overrides(descriptor: Dict[str, Any]) -> Dict[str, Any]:
+    overrides = {
+        "id": SERVICE_ID_OVERRIDE,
+        "name": SERVICE_NAME_OVERRIDE,
+        "adapter": SERVICE_ADAPTER_OVERRIDE,
+        "local_url": SERVICE_LOCAL_URL_OVERRIDE,
+    }
+
+    for key, value in overrides.items():
+        if isinstance(value, str) and value.strip():
+            descriptor[key] = value.strip()
+
+    return descriptor
+
+
+def load_service_descriptor() -> Dict[str, Any]:
+    try:
+        with SERVICE_DESCRIPTOR_PATH.open("r", encoding="utf-8") as handle:
+            descriptor = json.load(handle)
+    except FileNotFoundError as err:
+        raise RuntimeError(f"Descriptor file not found: {SERVICE_DESCRIPTOR_PATH}") from err
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f"Descriptor file is not valid JSON: {err}") from err
+    except Exception as err:
+        raise RuntimeError(f"Could not load service descriptor: {err}") from err
+
+    if not isinstance(descriptor, dict):
+        raise RuntimeError("Descriptor root must be a JSON object")
+
+    return apply_service_descriptor_overrides(descriptor)
+
+
+def load_help_markdown() -> str:
+    candidates = [SERVICE_HELP_PATH, SERVICE_HELP_FALLBACK_PATH]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8")
+    raise RuntimeError("Help markdown file not found")
 
 
 try:
@@ -441,6 +491,27 @@ def extract_images_from_pdf(
 @app.get("/")
 async def root():
     return {"message": "pypdf API for MessyDesk"}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "md-pypdf_fs"}
+
+
+@app.get("/config")
+async def config():
+    try:
+        return load_service_descriptor()
+    except RuntimeError as err:
+        raise HTTPException(500, str(err))
+
+
+@app.get("/help", response_class=PlainTextResponse)
+async def help_markdown():
+    try:
+        return load_help_markdown()
+    except RuntimeError as err:
+        raise HTTPException(404, str(err))
 
 @app.post("/process")
 async def process_files(

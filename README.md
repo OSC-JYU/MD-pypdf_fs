@@ -82,7 +82,8 @@ Or directly:
 
 ## Adapter (MD-consumer)
 
-	TOPIC=md-pdf-splitter_fs node src/index.mjs
+
+	TOPIC=md-pypdf_fs DEV_URL=http://localhost:9002 node src/index.mjs
 
 ### Example API call
 
