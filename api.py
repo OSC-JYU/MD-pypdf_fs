@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import os
@@ -133,7 +134,7 @@ def infer_output_metadata(output_path: str, default_type: str, default_extension
     return 'image', ext
 
 
-def build_disk_response(request_json: dict, output_paths: List[str], default_type: str, default_extension: str) -> dict:
+def resolve_tmp_dir(request_json: dict) -> str:
     source_path = str(request_json.get('file', {}).get('path', ''))
     db_name = 'messydesk'
     parts = source_path.replace('\\', '/').split('/')
@@ -144,6 +145,11 @@ def build_disk_response(request_json: dict, output_paths: List[str], default_typ
 
     tmp_dir = os.path.join(MD_ROOT, 'data', db_name, 'tmp')
     os.makedirs(tmp_dir, exist_ok=True)
+    return tmp_dir
+
+
+def build_disk_response(request_json: dict, output_paths: List[str], default_type: str, default_extension: str) -> dict:
+    tmp_dir = resolve_tmp_dir(request_json)
 
     files = []
     for output_path in output_paths:
@@ -155,7 +161,8 @@ def build_disk_response(request_json: dict, output_paths: List[str], default_typ
                 if os.path.exists(target_path):
                     callback_name = f"{uuid.uuid4().hex}_{safe_name}"
                     target_path = os.path.join(tmp_dir, callback_name)
-                shutil.copy2(output_path, target_path)
+                # move, not copy: the work dir is removed after the response is built
+                shutil.move(output_path, target_path)
 
         output_type, output_extension = infer_output_metadata(output_path, default_type, default_extension)
         files.append(
@@ -282,10 +289,8 @@ def fix_broken_pdf(input_path):
         raise
 
 
-def split_pdf_to_pages(input_file: str) -> Dict[str, Any]:
+def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
     temp_file = None
-    input_dir = os.path.dirname(input_file)
-    output_dir = os.path.join(input_dir, 'pages')
     os.makedirs(output_dir, exist_ok=True)
 
     try:
@@ -323,10 +328,8 @@ def split_pdf_to_pages(input_file: str) -> Dict[str, Any]:
             os.remove(temp_file)
 
 
-def extract_text_from_pdf(input_file: str, source_label: Optional[str] = None) -> Dict[str, Any]:
+def extract_text_from_pdf(input_file: str, output_dir: str, source_label: Optional[str] = None) -> Dict[str, Any]:
     temp_file = None
-    input_dir = os.path.dirname(input_file)
-    output_dir = os.path.join(input_dir, 'pages')
     os.makedirs(output_dir, exist_ok=True)
 
     try:
@@ -372,14 +375,13 @@ def extract_text_from_pdf(input_file: str, source_label: Optional[str] = None) -
 
 def extract_images_from_pdf(
     input_file: str,
+    output_dir: str,
     source_label: Optional[str] = None,
     min_width: int = DEFAULT_IMAGE_MIN_WIDTH,
     min_height: int = DEFAULT_IMAGE_MIN_HEIGHT,
     max_aspect_ratio: float = DEFAULT_IMAGE_MAX_ASPECT_RATIO,
 ) -> Dict[str, Any]:
     temp_file = None
-    input_dir = os.path.dirname(input_file)
-    output_dir = os.path.join(input_dir, 'pages')
     os.makedirs(output_dir, exist_ok=True)
 
     try:
@@ -518,6 +520,7 @@ async def process_files(
     message: UploadFile = File(...)
 ):
     input_file = None
+    work_dir = None
     try:
         log_event("info", "process_start")
 
@@ -541,13 +544,18 @@ async def process_files(
         task = request_json.get('task', {})
         task_id = task.get('id', 'split') if isinstance(task, dict) else 'split'
 
+        # Outputs are written to a per-request work dir inside MessyDesk's tmp/ (same file system,
+        # so moving them to tmp/ is a rename) and the dir is removed afterwards. Writing next to
+        # the source file left a second copy of every output in project storage.
+        work_dir = tempfile.mkdtemp(prefix='.pypdf_', dir=resolve_tmp_dir(request_json))
+
         if task_id == 'split':
-            result = split_pdf_to_pages(input_file)
+            result = await run_in_threadpool(split_pdf_to_pages, input_file, work_dir)
             output_paths = result.get("page_paths", [])
             output_type = "pdf"
             output_extension = "pdf"
         elif task_id == 'extract_text':
-            result = extract_text_from_pdf(input_file, request_json.get('file', {}).get('label'))
+            result = await run_in_threadpool(extract_text_from_pdf, input_file, work_dir, request_json.get('file', {}).get('label'))
             output_paths = result.get("text_paths", [])
             output_type = "text"
             output_extension = "txt"
@@ -560,8 +568,10 @@ async def process_files(
             min_height = parse_int_param(task_params, 'min_height', DEFAULT_IMAGE_MIN_HEIGHT)
             max_aspect_ratio = parse_float_param(task_params, 'max_aspect_ratio', DEFAULT_IMAGE_MAX_ASPECT_RATIO)
 
-            result = extract_images_from_pdf(
+            result = await run_in_threadpool(
+                extract_images_from_pdf,
                 input_file,
+                work_dir,
                 source_label=request_json.get('file', {}).get('label'),
                 min_width=min_width,
                 min_height=min_height,
@@ -590,6 +600,9 @@ async def process_files(
     except Exception as err:
         log_event("error", "process_failed", input_file=input_file, error=str(err))
         raise HTTPException(500, f"Processing failed: {str(err)}")
+    finally:
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -601,4 +614,4 @@ if __name__ == "__main__":
         container_mode=CONTAINER_MODE,
         md_root=MD_ROOT,
     )
-    uvicorn.run(app, host="0.0.0.0", port=9002)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "9002")))

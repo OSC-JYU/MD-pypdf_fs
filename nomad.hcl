@@ -1,3 +1,10 @@
+# The service reads and writes MessyDesk's data/ directly, so the job needs the host path of the
+# MessyDesk root: nomad job run -var md_path=/path/to/MessyDesk nomad.hcl
+variable "md_path" {
+  type        = string
+  description = "Host path of the MessyDesk root (the directory that contains data/)"
+}
+
 job "md-pypdf_fs" {
   type = "service"
 
@@ -21,7 +28,7 @@ job "md-pypdf_fs" {
 
     network {
       port "node" {
-        to = 8400
+        to = 9002
       }
     }
 
@@ -44,8 +51,11 @@ job "md-pypdf_fs" {
           image = "localhost/messydesk/md-pdf-splitter_fs:0.2"
           force_pull = false
           ports = ["node"]
+          volumes = ["${var.md_path}/data:/app/data:Z"]
       }
       env {
+        CONTAINER = "true"
+        MD_PATH = "/app"
         # Bind to Nomad's per-allocation assigned port, not a literal port: this driver runs
         # in host network mode, so the container binds host ports directly (no NAT via `to`).
         PORT = "${NOMAD_PORT_node}"
