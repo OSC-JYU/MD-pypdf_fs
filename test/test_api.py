@@ -24,6 +24,8 @@ class PdfSplitterApiTests(unittest.IsolatedAsyncioTestCase):
         sys.path.insert(0, str(cls.repo_root))
 
         os.environ["MD_PATH"] = cls.tempdir.name
+        # disk mode needs MD_PATH/data, otherwise the service falls back to HTTP mode
+        (Path(cls.tempdir.name) / "data").mkdir()
         os.environ["CONTAINER"] = "false"
 
         if "api" in sys.modules:
@@ -72,7 +74,7 @@ class PdfSplitterApiTests(unittest.IsolatedAsyncioTestCase):
     async def _call_process(self, payload: dict):
         content = json.dumps(payload).encode("utf-8")
         upload = UploadFile(filename="request.json", file=io.BytesIO(content))
-        return await self.api.process_files(upload)
+        return await self.api.process_files(upload, None)
 
     def _tmp_dir(self) -> Path:
         return Path(self.tempdir.name) / "data/dir_test/tmp"
@@ -124,6 +126,25 @@ class PdfSplitterApiTests(unittest.IsolatedAsyncioTestCase):
             await self._call_process(self._build_message(rel_pdf_path))
 
         self.assertEqual(ctx.exception.status_code, 404)
+
+    async def test_http_mode_serves_outputs_from_files(self):
+        writer = PdfWriter()
+        for _ in range(2):
+            writer.add_blank_page(width=595, height=842)
+        pdf = io.BytesIO()
+        writer.write(pdf)
+        pdf.seek(0)
+        message = self._build_message("upload.pdf")
+        del message["file"]["path"]
+        upload = UploadFile(filename="request.json", file=io.BytesIO(json.dumps(message).encode("utf-8")))
+
+        with tempfile.TemporaryDirectory() as out, patch.object(self.api, "OUTPUT_FOLDER", Path(out).resolve()):
+            result = await self.api.process_files(upload, UploadFile(filename="upload.pdf", file=pdf))
+            uris = result["response"]["uri"]
+            self.assertEqual(result["response"]["type"], "stored")
+            self.assertEqual([u.rsplit("/", 1)[1] for u in uris], ["page_001.pdf", "page_002.pdf"])
+            output_id = uris[0].split("/")[2]
+            self.assertEqual(sorted(p.name for p in (Path(out) / output_id).iterdir()), ["page_001.pdf", "page_002.pdf"])
 
     async def test_rejects_path_traversal(self):
         with self.assertRaises(HTTPException) as ctx:

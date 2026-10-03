@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
-COPY api.py service.json ./
+COPY api.py md_storage.py service.json ./
 COPY help/index.md ./help/index.md
 
 # Expose the port the app runs on

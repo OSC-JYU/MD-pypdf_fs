@@ -1,7 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 import os
 from dotenv import load_dotenv
 import json
@@ -12,15 +12,19 @@ import tempfile
 import logging
 import io
 import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 from PIL import Image
 
+import md_storage
+
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 MD_PATH_ENV = os.getenv("MD_PATH", "")
-CONTAINER_MODE = os.getenv("CONTAINER", "").strip().lower() in ("1", "true", "yes", "on")
-STORAGE_MODE = (os.getenv("STORAGE_MODE") or os.getenv("FILE_STORAGE_MODE") or "disk").strip().lower()
+# HTTP mode keeps outputs here until the consumer downloads them
+OUTPUT_FOLDER = Path(os.getenv("OUTPUT_FOLDER", "./output")).resolve()
+OUTPUT_MAX_AGE_SECONDS = int(os.getenv("OUTPUT_MAX_AGE_SECONDS", str(24 * 3600)))
 
 REQUEST_READ_CHUNK_SIZE = int(os.getenv("REQUEST_READ_CHUNK_SIZE", str(1024 * 1024)))
 
@@ -46,47 +50,12 @@ def log_event(level: str, event: str, **fields):
     getattr(logger, level, logger.info)(line)
 
 
-def resolve_md_root(md_path_env: str, container_mode: bool) -> str:
-    """Resolve MessyDesk root that contains data/."""
-    if STORAGE_MODE == "disk" and (not isinstance(md_path_env, str) or not md_path_env.strip()):
-        raise RuntimeError("MD_PATH must be set when STORAGE_MODE=disk")
-
-    candidates = []
-    if isinstance(md_path_env, str) and md_path_env.strip():
-        raw = os.path.abspath(md_path_env.strip())
-        if os.path.basename(raw) == 'data':
-            candidates.append(os.path.dirname(raw))
-        candidates.append(raw)
-
-    if container_mode:
-        candidates.append('/app')
-
-    candidates.append(os.path.abspath('.'))
-
-    seen = set()
-    existing_dirs = []
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if os.path.isdir(os.path.join(candidate, 'data')):
-            return candidate
-        if os.path.isdir(candidate):
-            existing_dirs.append(candidate)
-
-    if existing_dirs:
-        return existing_dirs[0]
-
-    raise RuntimeError(
-        "Could not resolve MessyDesk data root. Set MD_PATH to the MessyDesk root "
-        "(contains data/). If running in container, set CONTAINER=true and MD_PATH=/app."
-    )
-
-
 def resolve_md_relative_path(relative_path: str) -> str:
     """Resolve a MessyDesk relative path under MD_ROOT and block traversal/absolute input."""
     if not isinstance(relative_path, str) or not relative_path.strip():
         raise HTTPException(400, "Invalid file.path")
+    if not md_storage.DISK_MODE:
+        raise HTTPException(400, "No file uploaded as 'content', and disk mode is off (MD_PATH not found)")
     if os.path.isabs(relative_path):
         raise HTTPException(400, "file.path must be relative to MD_PATH")
 
@@ -97,7 +66,7 @@ def resolve_md_relative_path(relative_path: str) -> str:
     return resolved
 
 
-def parse_request_payload(raw: bytes) -> Dict:
+def parse_request_payload(raw: bytes, require_path: bool = True) -> Dict:
     try:
         payload = json.loads(raw.decode('utf-8'))
     except Exception:
@@ -107,7 +76,7 @@ def parse_request_payload(raw: bytes) -> Dict:
         raise HTTPException(400, "Request payload must be a JSON object")
     if 'file' not in payload or not isinstance(payload['file'], dict):
         raise HTTPException(400, "Missing required fields: file")
-    if 'path' not in payload['file']:
+    if require_path and 'path' not in payload['file']:
         raise HTTPException(400, "Missing required fields: file.path")
     return payload
 
@@ -205,7 +174,8 @@ def apply_service_descriptor_overrides(descriptor: Dict[str, Any]) -> Dict[str, 
     overrides = {
         "id": SERVICE_ID_OVERRIDE,
         "name": SERVICE_NAME_OVERRIDE,
-        "adapter": SERVICE_ADAPTER_OVERRIDE,
+        # elg_fs in disk mode, elg in HTTP mode, unless SERVICE_ADAPTER says otherwise
+        "adapter": SERVICE_ADAPTER_OVERRIDE or md_storage.storage_adapter(),
         "local_url": SERVICE_LOCAL_URL_OVERRIDE,
     }
 
@@ -241,11 +211,8 @@ def load_help_markdown() -> str:
     raise RuntimeError("Help markdown file not found")
 
 
-try:
-    MD_ROOT = resolve_md_root(MD_PATH_ENV, CONTAINER_MODE)
-except RuntimeError as err:
-    print(f"ERROR: {err} \nexiting...")
-    exit(1)
+# None in HTTP mode (MD_PATH unset or without data/), see md_storage.py
+MD_ROOT = str(md_storage.MD_ROOT) if md_storage.DISK_MODE else None
 
 app = FastAPI(
     title="pypdf API",
@@ -515,12 +482,61 @@ async def help_markdown():
     except RuntimeError as err:
         raise HTTPException(404, str(err))
 
+def build_http_response(output_id: str, output_paths: List[str]) -> dict:
+    """HTTP mode: a list of plain uris, so the elg adapter keeps each file name as the label and
+    types it by extension, as the disk response does."""
+    return {
+        "response": {
+            "type": "stored",
+            "uri": [f"/files/{output_id}/{os.path.basename(p)}" for p in output_paths],
+        },
+    }
+
+
+def sweep_stale_outputs():
+    """Remove HTTP outputs nobody downloaded (a failed consumer job leaves them behind)."""
+    if not OUTPUT_FOLDER.is_dir():
+        return
+    limit = time.time() - OUTPUT_MAX_AGE_SECONDS
+    for entry in OUTPUT_FOLDER.iterdir():
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < limit:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            pass
+
+
+@app.get("/files/{output_id}/{filename}")
+async def serve_file(output_id: str, filename: str, background_tasks: BackgroundTasks):
+    file_path = (OUTPUT_FOLDER / output_id / filename).resolve()
+    if file_path.parent.parent != OUTPUT_FOLDER or not file_path.is_file():
+        raise HTTPException(404, "File not found")
+
+    def remove_file(path: Path):
+        # each output is downloaded once; the dir goes with its last file
+        try:
+            path.unlink()
+            if not any(path.parent.iterdir()):
+                path.parent.rmdir()
+        except OSError as err:
+            log_event("error", "file_remove_failed", path=str(path), error=str(err))
+
+    background_tasks.add_task(remove_file, file_path)
+    return FileResponse(str(file_path), background=background_tasks)
+
+
 @app.post("/process")
 async def process_files(
-    message: UploadFile = File(...)
+    message: UploadFile = File(...),
+    # with a content upload the PDF comes over HTTP and the outputs are served from /files;
+    # without one it is read from MessyDesk's storage (disk mode, see md_storage.py)
+    content: Optional[UploadFile] = File(None)
 ):
     input_file = None
     work_dir = None
+    http_mode = content is not None
+    output_id = None
+    served_ok = False
     try:
         log_event("info", "process_start")
 
@@ -531,9 +547,18 @@ async def process_files(
             if not chunk:
                 break
             request_chunks.append(chunk)
-        request_json = parse_request_payload(b"".join(request_chunks))
+        request_json = parse_request_payload(b"".join(request_chunks), require_path=not http_mode)
 
-        input_file = resolve_md_relative_path(request_json['file']['path'])
+        if http_mode:
+            sweep_stale_outputs()
+            output_id = uuid.uuid4().hex
+            output_dir = OUTPUT_FOLDER / output_id
+            output_dir.mkdir(parents=True)
+            input_file = str(output_dir / ".input.pdf")
+            with open(input_file, "wb") as handle:
+                shutil.copyfileobj(content.file, handle, REQUEST_READ_CHUNK_SIZE)
+        else:
+            input_file = resolve_md_relative_path(request_json['file']['path'])
         file_rid = request_json.get('file', {}).get('@rid')
         process_rid = request_json.get('process', {}).get('@rid') if isinstance(request_json.get('process'), dict) else None
         log_event("info", "process_context", input_file=input_file, file_rid=file_rid, process_rid=process_rid)
@@ -547,7 +572,8 @@ async def process_files(
         # Outputs are written to a per-request work dir inside MessyDesk's tmp/ (same file system,
         # so moving them to tmp/ is a rename) and the dir is removed afterwards. Writing next to
         # the source file left a second copy of every output in project storage.
-        work_dir = tempfile.mkdtemp(prefix='.pypdf_', dir=resolve_tmp_dir(request_json))
+        # In HTTP mode the outputs are written straight into the served output dir.
+        work_dir = tempfile.mkdtemp(prefix='.pypdf_', dir=str(OUTPUT_FOLDER / output_id) if http_mode else resolve_tmp_dir(request_json))
 
         if task_id == 'split':
             result = await run_in_threadpool(split_pdf_to_pages, input_file, work_dir)
@@ -591,7 +617,17 @@ async def process_files(
             page_count=result["page_count"],
             successful_pages=result["successful_pages"],
         )
-        response = build_disk_response(request_json, output_paths, output_type, output_extension)
+        if http_mode:
+            served = []
+            for output_path in output_paths:
+                target = OUTPUT_FOLDER / output_id / os.path.basename(output_path)
+                shutil.move(output_path, str(target))
+                served.append(str(target))
+            os.unlink(input_file)
+            response = build_http_response(output_id, served)
+            served_ok = True
+        else:
+            response = build_disk_response(request_json, output_paths, output_type, output_extension)
         response["page_count"] = result["page_count"]
         response["successful_pages"] = result["successful_pages"]
         return response
@@ -603,6 +639,9 @@ async def process_files(
     finally:
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
+        if http_mode and output_id and not served_ok:
+            # nothing of a failed run is served
+            shutil.rmtree(OUTPUT_FOLDER / output_id, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -611,7 +650,6 @@ if __name__ == "__main__":
         "info",
         "service_start",
         md_path_env=MD_PATH_ENV,
-        container_mode=CONTAINER_MODE,
-        md_root=MD_ROOT,
+        storage_mode=md_storage.describe_mode(),
     )
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "9002")))

@@ -78,7 +78,6 @@ Or directly:
 	docker run --name md-pdf-splitter_fs -p 9002:9002 \
 	  -e MD_URL=http://host.containers.internal:8200 \
 	  -v [MESSYDESK-PATH]/data/:/app/data:Z \
-	  -e CONTAINER=true \
 	  -e MD_PATH=/app \
 	  messydesk/md-pdf-splitter_fs:0.1
 
@@ -102,16 +101,14 @@ Required:
 - `MD_PATH`: path to MessyDesk root (directory that contains `data/`)
 	- local Python run (host): `MD_PATH=/home/<user>/Projects/MessyDesk`
 	- container run: `MD_PATH=/app`
-- `CONTAINER`: set `CONTAINER=true` when running in container
 
 Important:
-- When `STORAGE_MODE=disk` (or `FILE_STORAGE_MODE=disk`), `MD_PATH` must be set.
+- Without a usable `MD_PATH` the service starts in HTTP mode (see "Storage modes" below).
 - Disk responses use filename-only `response.files[].path` values (no absolute path).
 
 Path notes:
 
 - Service resolves runtime root from `MD_PATH` and validates it contains `data/`.
-- Container mode is explicit; no container auto-detection heuristics are used.
 
 Optional:
 
@@ -149,3 +146,14 @@ Adapter (`elg_fs`) sends one `/tmp` callback per file using filename-only `tmp_p
 
 
 
+
+## Storage modes
+
+The service picks its mode at start-up:
+
+- **Disk mode** when `MD_PATH` points at the MessyDesk root (the directory that contains `data/`). The service reads the input from `message.file.path`, writes its output to `MD_PATH/data/<db>/tmp/`, and `/config` reports the `elg_fs` adapter. In a container, mount MessyDesk's `data/` and set `MD_PATH` to the mount's parent directory, for example `-v /path/to/MessyDesk/data:/app/data -e MD_PATH=/app`.
+- **HTTP mode** when `MD_PATH` is unset or has no `data/`. The input comes as the `content` upload, outputs are served from `/files`, and `/config` reports the `elg` adapter. `STORAGE_MODE=http` forces this mode.
+
+A request that uploads `content` is always handled in HTTP mode. `SERVICE_ADAPTER` overrides the adapter that `/config` reports.
+
+In HTTP mode the outputs are kept in `OUTPUT_FOLDER` (default `./output`) until they are downloaded once from `/files/<id>/<name>`; outputs nobody downloads are removed after `OUTPUT_MAX_AGE_SECONDS` (default one day).
