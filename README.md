@@ -9,11 +9,13 @@ It reads and writes directly under MessyDesk file storage (`_fs`).
 
 ## Tasks
 
-- `split`: split a PDF into one-page PDF files under `pages/page_N.pdf`.
-- `extract_text`: extract each page text to `pages/<pdf_label>_page_N.pdf.txt`.
+- `split`: split a PDF into one-page PDF files `page_NNN.pdf`.
+- `extract_text`: extract each page text to `<pdf_label>_page_N.pdf.txt`.
 	- Single-page input keeps original page label, for example `page_001.pdf` -> `page_001.pdf.txt`.
-- `extract_images`: extract embedded PDF images to `pages/<pdf_label>_page_N_image_M.jpg|png`.
+- `extract_images`: extract embedded PDF images to `<pdf_label>_page_N_image_M.jpg|png`.
 	- Small or extreme-aspect-ratio images are skipped by default.
+
+Outputs are written to MessyDesk's `data/<db>/tmp/`, from where MessyDesk moves them into the project.
 
 ### extract_images defaults
 
