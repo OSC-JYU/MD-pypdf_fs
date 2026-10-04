@@ -10,13 +10,11 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError, PyPdfError
 import tempfile
 import logging
-import io
 import shutil
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
-from PIL import Image
 
 import md_storage
 
@@ -35,10 +33,6 @@ SERVICE_ID_OVERRIDE = os.getenv("SERVICE_ID")
 SERVICE_NAME_OVERRIDE = os.getenv("SERVICE_NAME")
 SERVICE_ADAPTER_OVERRIDE = os.getenv("SERVICE_ADAPTER")
 SERVICE_LOCAL_URL_OVERRIDE = os.getenv("SERVICE_LOCAL_URL")
-
-DEFAULT_IMAGE_MIN_WIDTH = int(os.getenv("PDF_IMAGE_MIN_WIDTH", "200"))
-DEFAULT_IMAGE_MIN_HEIGHT = int(os.getenv("PDF_IMAGE_MIN_HEIGHT", "200"))
-DEFAULT_IMAGE_MAX_ASPECT_RATIO = float(os.getenv("PDF_IMAGE_MAX_ASPECT_RATIO", "8.0"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("md-pdf-splitter-fs")
@@ -91,18 +85,6 @@ def callback_enabled(request_json: dict) -> bool:
     )
 
 
-def infer_output_metadata(output_path: str, default_type: str, default_extension: str) -> Tuple[str, str]:
-    if default_type != "image":
-        return default_type, default_extension
-
-    ext = os.path.splitext(output_path)[1].lower().lstrip('.')
-    if ext == 'jpeg':
-        ext = 'jpg'
-    if ext not in {'jpg', 'png'}:
-        ext = 'png'
-    return 'image', ext
-
-
 def resolve_tmp_dir(request_json: dict) -> str:
     source_path = str(request_json.get('file', {}).get('path', ''))
     db_name = 'messydesk'
@@ -133,13 +115,12 @@ def build_disk_response(request_json: dict, output_paths: List[str], default_typ
                 # move, not copy: the work dir is removed after the response is built
                 shutil.move(output_path, target_path)
 
-        output_type, output_extension = infer_output_metadata(output_path, default_type, default_extension)
         files.append(
             {
                 "path": callback_name,
                 "label": safe_name,
-                "type": output_type,
-                "extension": output_extension,
+                "type": default_type,
+                "extension": default_extension,
             }
         )
 
@@ -150,24 +131,6 @@ def build_disk_response(request_json: dict, output_paths: List[str], default_typ
             "files": files,
         },
     }
-
-
-def parse_int_param(params: dict, key: str, default: int, minimum: int = 1) -> int:
-    value = params.get(key, default)
-    try:
-        parsed = int(value)
-        return parsed if parsed >= minimum else default
-    except (TypeError, ValueError):
-        return default
-
-
-def parse_float_param(params: dict, key: str, default: float, minimum: float = 1.0) -> float:
-    value = params.get(key, default)
-    try:
-        parsed = float(value)
-        return parsed if parsed >= minimum else default
-    except (TypeError, ValueError):
-        return default
 
 
 def apply_service_descriptor_overrides(descriptor: Dict[str, Any]) -> Dict[str, Any]:
@@ -257,6 +220,8 @@ def fix_broken_pdf(input_path):
 
 
 def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
+    """One single-page PDF per page. A page that cannot be written is skipped and listed in
+    failed_pages; when no page can be written the split fails."""
     temp_file = None
     os.makedirs(output_dir, exist_ok=True)
 
@@ -270,24 +235,39 @@ def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
             reader = PdfReader(temp_file)
             page_count = len(reader.pages)
 
-        successful_pages = 0
+        # the original is removed after the import, so each page keeps its document's metadata
+        # (title, author, dates), which pdfinfo shows
+        try:
+            metadata = {k: v for k, v in (reader.metadata or {}).items() if isinstance(v, str)}
+        except Exception:
+            metadata = {}
+
         page_paths: List[str] = []
+        failed_pages: List[Dict[str, Any]] = []
         pad_width = max(3, len(str(page_count)))
-        for i, page in enumerate(reader.pages, start=1):
+        for i in range(1, page_count + 1):
             try:
                 writer = PdfWriter()
-                writer.add_page(page)
+                writer.add_page(reader.pages[i - 1])
+                if metadata:
+                    writer.add_metadata(metadata)
                 output_path = os.path.join(output_dir, f"page_{i:0{pad_width}d}.pdf")
                 with open(output_path, "wb") as f:
                     writer.write(f)
-                successful_pages += 1
                 page_paths.append(output_path)
-            except (PyPdfError, IOError, OSError, Exception) as err:
+            except Exception as err:
                 log_event("warning", "pdf_page_write_failed", page=i, error=str(err))
+                failed_pages.append({"page": i, "error": str(err)[:300]})
+
+        if page_count and not page_paths:
+            raise PageSplitError(f"None of the {page_count} pages could be split: {failed_pages[0]['error']}")
+        if not page_count:
+            raise PageSplitError("The PDF has no pages")
 
         return {
             "page_count": page_count,
-            "successful_pages": successful_pages,
+            "successful_pages": len(page_paths),
+            "failed_pages": failed_pages,
             "page_paths": page_paths,
         }
     finally:
@@ -295,166 +275,8 @@ def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
             os.remove(temp_file)
 
 
-def extract_text_from_pdf(input_file: str, output_dir: str, source_label: Optional[str] = None) -> Dict[str, Any]:
-    temp_file = None
-    os.makedirs(output_dir, exist_ok=True)
-
-    try:
-        try:
-            reader = PdfReader(input_file)
-            page_count = len(reader.pages)
-        except (PdfReadError, Exception) as err:
-            log_event("warning", "pdf_read_failed_try_fix", input_file=input_file, error=str(err))
-            temp_file = fix_broken_pdf(input_file)
-            reader = PdfReader(temp_file)
-            page_count = len(reader.pages)
-
-        successful_pages = 0
-        text_paths: List[str] = []
-        # Prefer graph/node label over storage path basename, so labels remain user-meaningful.
-        label_basename = os.path.basename(source_label) if isinstance(source_label, str) and source_label else os.path.basename(input_file)
-        label_stem = os.path.splitext(label_basename)[0]
-        for i, page in enumerate(reader.pages, start=1):
-            try:
-                page_text = page.extract_text() or ""
-                if page_count == 1:
-                    # Preserve split-page names such as page_12.pdf -> page_12.pdf.txt.
-                    output_filename = f"{label_basename}.txt"
-                else:
-                    output_filename = f"{label_stem}_page_{i}.pdf.txt"
-                output_path = os.path.join(output_dir, output_filename)
-                with open(output_path, "w", encoding="utf-8") as handle:
-                    handle.write(page_text)
-                successful_pages += 1
-                text_paths.append(output_path)
-            except Exception as err:
-                log_event("warning", "pdf_page_text_extract_failed", page=i, error=str(err))
-
-        return {
-            "page_count": page_count,
-            "successful_pages": successful_pages,
-            "text_paths": text_paths,
-        }
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
-
-
-def extract_images_from_pdf(
-    input_file: str,
-    output_dir: str,
-    source_label: Optional[str] = None,
-    min_width: int = DEFAULT_IMAGE_MIN_WIDTH,
-    min_height: int = DEFAULT_IMAGE_MIN_HEIGHT,
-    max_aspect_ratio: float = DEFAULT_IMAGE_MAX_ASPECT_RATIO,
-) -> Dict[str, Any]:
-    temp_file = None
-    os.makedirs(output_dir, exist_ok=True)
-
-    try:
-        try:
-            reader = PdfReader(input_file)
-            page_count = len(reader.pages)
-        except (PdfReadError, Exception) as err:
-            log_event("warning", "pdf_read_failed_try_fix", input_file=input_file, error=str(err))
-            temp_file = fix_broken_pdf(input_file)
-            reader = PdfReader(temp_file)
-            page_count = len(reader.pages)
-
-        image_paths: List[str] = []
-        successful_images = 0
-        label_basename = os.path.basename(source_label) if isinstance(source_label, str) and source_label else os.path.basename(input_file)
-        label_stem = os.path.splitext(label_basename)[0]
-
-        for page_num, page in enumerate(reader.pages, start=1):
-            page_images = getattr(page, "images", [])
-            for image_index, image_file in enumerate(page_images, start=1):
-                try:
-                    image_name = getattr(image_file, "name", "") or ""
-                    image_data = getattr(image_file, "data", None)
-                    source_ext = os.path.splitext(image_name)[1].lower().lstrip('.')
-                    if source_ext == 'jpeg':
-                        source_ext = 'jpg'
-
-                    output_ext = 'png'
-                    output_bytes = None
-
-                    pil_img = None
-                    if isinstance(image_data, (bytes, bytearray)):
-                        pil_img = Image.open(io.BytesIO(image_data))
-                    else:
-                        log_event("warning", "pdf_image_extract_failed", page=page_num, image_index=image_index, reason="no_image_data")
-                        continue
-
-                    width, height = pil_img.size
-                    if width < min_width or height < min_height:
-                        log_event(
-                            "info",
-                            "pdf_image_skipped_small",
-                            page=page_num,
-                            image_index=image_index,
-                            width=width,
-                            height=height,
-                            min_width=min_width,
-                            min_height=min_height,
-                        )
-                        continue
-
-                    aspect_ratio = max(width / height, height / width)
-                    if aspect_ratio > max_aspect_ratio:
-                        log_event(
-                            "info",
-                            "pdf_image_skipped_aspect_ratio",
-                            page=page_num,
-                            image_index=image_index,
-                            width=width,
-                            height=height,
-                            aspect_ratio=round(aspect_ratio, 3),
-                            max_aspect_ratio=max_aspect_ratio,
-                        )
-                        continue
-
-                    # Keep native jpg/png payload when possible for speed and fidelity.
-                    if source_ext in {'jpg', 'png'}:
-                        output_ext = source_ext
-                        output_bytes = bytes(image_data)
-                    else:
-                        if pil_img.mode in ("RGBA", "LA", "P"):
-                            pil_img = pil_img.convert("RGBA")
-                        else:
-                            pil_img = pil_img.convert("RGB")
-
-                        buffer = io.BytesIO()
-                        if pil_img.mode == "RGBA":
-                            output_ext = 'png'
-                            pil_img.save(buffer, format='PNG')
-                        else:
-                            output_ext = 'jpg'
-                            pil_img.save(buffer, format='JPEG', quality=90)
-                        output_bytes = buffer.getvalue()
-
-                    if not output_bytes:
-                        log_event("warning", "pdf_image_extract_failed", page=page_num, image_index=image_index, reason="no_image_bytes")
-                        continue
-
-                    output_filename = f"{label_stem}_page_{page_num}_image_{image_index}.{output_ext}"
-                    output_path = os.path.join(output_dir, output_filename)
-                    with open(output_path, 'wb') as handle:
-                        handle.write(output_bytes)
-
-                    successful_images += 1
-                    image_paths.append(output_path)
-                except Exception as err:
-                    log_event("warning", "pdf_image_extract_failed", page=page_num, image_index=image_index, error=str(err))
-
-        return {
-            "page_count": page_count,
-            "successful_pages": successful_images,
-            "image_paths": image_paths,
-        }
-    finally:
-        if temp_file and os.path.exists(temp_file):
-            os.remove(temp_file)
+class PageSplitError(ValueError):
+    """The PDF could be read but gave no pages; reported to the user as the job's error."""
 
 
 @app.get("/")
@@ -575,39 +397,10 @@ async def process_files(
         # In HTTP mode the outputs are written straight into the served output dir.
         work_dir = tempfile.mkdtemp(prefix='.pypdf_', dir=str(OUTPUT_FOLDER / output_id) if http_mode else resolve_tmp_dir(request_json))
 
-        if task_id == 'split':
-            result = await run_in_threadpool(split_pdf_to_pages, input_file, work_dir)
-            output_paths = result.get("page_paths", [])
-            output_type = "pdf"
-            output_extension = "pdf"
-        elif task_id == 'extract_text':
-            result = await run_in_threadpool(extract_text_from_pdf, input_file, work_dir, request_json.get('file', {}).get('label'))
-            output_paths = result.get("text_paths", [])
-            output_type = "text"
-            output_extension = "txt"
-        elif task_id == 'extract_images':
-            task_params = task.get('params', {}) if isinstance(task, dict) else {}
-            if not isinstance(task_params, dict):
-                task_params = {}
-
-            min_width = parse_int_param(task_params, 'min_width', DEFAULT_IMAGE_MIN_WIDTH)
-            min_height = parse_int_param(task_params, 'min_height', DEFAULT_IMAGE_MIN_HEIGHT)
-            max_aspect_ratio = parse_float_param(task_params, 'max_aspect_ratio', DEFAULT_IMAGE_MAX_ASPECT_RATIO)
-
-            result = await run_in_threadpool(
-                extract_images_from_pdf,
-                input_file,
-                work_dir,
-                source_label=request_json.get('file', {}).get('label'),
-                min_width=min_width,
-                min_height=min_height,
-                max_aspect_ratio=max_aspect_ratio,
-            )
-            output_paths = result.get("image_paths", [])
-            output_type = "image"
-            output_extension = "png"
-        else:
-            raise HTTPException(400, f"Unsupported task: {task_id}")
+        if task_id != 'split':
+            raise HTTPException(400, f"Unsupported task: {task_id} (this service only splits PDFs)")
+        result = await run_in_threadpool(split_pdf_to_pages, input_file, work_dir)
+        output_paths = result["page_paths"]
 
         log_event(
             "info",
@@ -627,12 +420,16 @@ async def process_files(
             response = build_http_response(output_id, served)
             served_ok = True
         else:
-            response = build_disk_response(request_json, output_paths, output_type, output_extension)
-        response["page_count"] = result["page_count"]
-        response["successful_pages"] = result["successful_pages"]
+            response = build_disk_response(request_json, output_paths, "pdf", "pdf")
+        # inside "response", so that the consumer passes them on to MessyDesk with every page
+        response["response"]["page_count"] = result["page_count"]
+        response["response"]["failed_pages"] = result["failed_pages"]
         return response
     except HTTPException:
         raise
+    except PageSplitError as err:
+        log_event("error", "process_failed", input_file=input_file, error=str(err))
+        raise HTTPException(422, str(err))
     except Exception as err:
         log_event("error", "process_failed", input_file=input_file, error=str(err))
         raise HTTPException(500, f"Processing failed: {str(err)}")

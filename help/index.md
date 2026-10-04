@@ -1,28 +1,35 @@
-# MD-pyPDF_FS Service
+# PyPDF (PDF splitter)
 
-The **MD-pypdf_fs** service is a PDF service backed by the Python open-source library **`pypdf`**. It provides lightweight, memory-efficient operations for slicing and extracting data from PDF documents page by page.
+Splits every PDF you import into **one PDF per page**. You don't run it yourself: MessyDesk does
+it when a PDF is uploaded or unpacked from a ZIP, and the pages appear as a set named after the
+PDF ("… — PDF pages"). The original PDF is then removed, so each page is its own file that you
+can run crunchers on, view and tag.
 
-For advanced text extraction or native-resolution image parsing, see the **MD-Poppler Service** help file.
+It uses [pypdf](https://pypdf.readthedocs.io/).
 
----
+## Why pages
 
-## Available Crunchers
+Many crunchers handle one page at a time, and large PDFs are slow and memory-hungry to process as
+a whole. With pages you can also pick just the pages you need, run a cruncher on a set of pages,
+and see results page by page.
 
-### `split`
-Splits a single multi-page PDF document into a set of individual, one-page PDF nodes.
+Each page keeps the document's information (title, author, creation date), which **Poppler →
+PDF info** shows.
 
-* **Why this is important:** Large, hundred-megabyte PDF files can be incredibly resource-heavy and memory-hungry to process. Breaking a document into a flat set of single pages ensures you can run downstream analysis (like OCR or classification) efficiently without running into out-of-memory errors or system slowdowns.
+## What to use next
 
-### `extract_text`
-Extracts the embedded, structural text layers from a PDF, generating exactly **one text file (`.txt`) per page**.
+| To get | Use |
+|---|---|
+| The text of a page (digital PDFs) | **Poppler → Extract text from PDF** |
+| A page as an image (for OCR, viewing) | **Poppler → Render PDF as images** |
+| The images embedded in a page | **Poppler → Extract images from PDF** |
+| Title, author, dates, page size | **Poppler → PDF info** |
+| Text of scanned pages | render them as images, then **Tesseract** or another OCR cruncher |
 
-* > ⚠️ **Note:** Like other native PDF text-extraction utilities, this cruncher reads digital text strings embedded in the file structure. It does not perform Optical Character Recognition (OCR) on flat, scanned images.
+## When something goes wrong
 
-### `extract_images`
-Extracts inline, embedded image assets out of each individual page file.
-
----
-
-## External Resources
-For developers or advanced users wishing to dig deeper into the underlying processing engine's architecture and capabilities, consult the official documentation:
-* [pypdf Documentation](https://pypdf.readthedocs.io/en/stable/)
+- If some pages cannot be split (a damaged page), the others are imported and the import process
+  says which pages are missing and why.
+- If no page can be split, the import fails and the process shows the reason. Try repairing the
+  PDF (e.g. by printing it to a new PDF) and import it again.
+- PDFs with junk before the start of the file (common in downloads) are repaired automatically.

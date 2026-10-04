@@ -1,5 +1,5 @@
 
-# MD-pdf-splitter_fs
+# MD-pypdf_fs
 
 An experimental MessyDesk wrapper for:
 https://github.com/py-pdf/pypdf
@@ -7,43 +7,19 @@ https://github.com/py-pdf/pypdf
 The purpose of this service is to split a PDF into one-page PDF files.
 It reads and writes directly under MessyDesk file storage (`_fs`).
 
-## Tasks
+## Task
 
-- `split`: split a PDF into one-page PDF files `page_NNN.pdf`.
-- `extract_text`: extract each page text to `<pdf_label>_page_N.pdf.txt`.
-	- Single-page input keeps original page label, for example `page_001.pdf` -> `page_001.pdf.txt`.
-- `extract_images`: extract embedded PDF images to `<pdf_label>_page_N_image_M.jpg|png`.
-	- Small or extreme-aspect-ratio images are skipped by default.
+- `split`: splits a PDF into one-page PDF files `page_NNN.pdf`. MessyDesk runs it on every PDF
+  it imports (role `import`); it is not offered as a cruncher (category `system`). Text and
+  images of the pages come from MD-poppler.
 
-Outputs are written to MessyDesk's `data/<db>/tmp/`, from where MessyDesk moves them into the project.
+Each page keeps the document's metadata (title, author, dates), since the original PDF is removed
+after the import. A page that cannot be written is skipped; the answer lists it in
+`response.failed_pages` (`[{page, error}]`, with `response.page_count`), which MessyDesk shows on
+the import process. When no page can be written the job fails with status 422 and the reason.
 
-### extract_images defaults
-
-Default filtering is enabled to ignore likely noise images:
-
-- `min_width = 200`
-- `min_height = 200`
-- `max_aspect_ratio = 8.0` where aspect ratio is `max(width/height, height/width)`
-
-Image output format:
-
-- Native embedded `jpg/png` is kept when possible.
-- Other embedded formats are converted to `jpg` or `png`.
-
-Task params can override defaults via queue message `task.params`:
-
-```json
-{
-	"task": {
-		"id": "extract_images",
-		"params": {
-			"min_width": 200,
-			"min_height": 200,
-			"max_aspect_ratio": 8.0
-		}
-	}
-}
-```
+Outputs are written to MessyDesk's `data/<db>/tmp/`, from where MessyDesk moves them into the
+project (disk mode), or served from `/files` (HTTP mode).
 
 ## API
 
