@@ -4,22 +4,38 @@
   "type": "pypdf",
   "api_type": "elg",
   "adapter": "elg_fs",
-  "category": "system",
+  "category": "preparation",
   "api": "/process",
   "name": "PyPDF",
   "supported_types": [
-    "pdf"
+    "original-pdf"
   ],
   "supported_formats": [
     "pdf"
   ],
-  "description": "Splits PDF files into one-page PDFs when they are imported. Text and images of the pages come from Poppler.",
+  "description": "Splits a PDF into one-page PDFs: all pages or a page range. The text and images of the pages come from Poppler.",
   "tasks": {
     "split": {
       "output_set": "PDF pages",
       "name": "Split PDF to pages",
-      "description": "Splits a PDF into one-page PDF files; run automatically on every imported PDF.",
-      "behaviour": "one-to-many"
+      "description": "Splits a PDF into one-page PDF files. Give a page range to split only some pages; the original PDF is deleted afterwards unless you keep it.",
+      "behaviour": "one-to-many",
+      "params_help": {
+        "pages": {
+          "name": "Pages",
+          "help": "Pages to split, for example 1-5,8,10- . Empty means all pages.",
+          "default": "",
+          "format": "page_range"
+        },
+        "delete_original": {
+          "name": "Delete the original PDF after splitting",
+          "help": "The file is removed from disk and the node stays as a record. Without it, the pages are the only way to work with the content.",
+          "display": "checkbox",
+          "default": true,
+          "warning": "Pages outside the range are lost for good.",
+          "warning_if_set": "pages"
+        }
+      }
     }
   }
 }

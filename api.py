@@ -11,6 +11,7 @@ from pypdf.errors import PdfReadError, PyPdfError
 import tempfile
 import logging
 import shutil
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -99,7 +100,8 @@ def resolve_tmp_dir(request_json: dict) -> str:
     return tmp_dir
 
 
-def build_disk_response(request_json: dict, output_paths: List[str], default_type: str, default_extension: str) -> dict:
+def build_disk_response(request_json: dict, output_paths: List[str], default_type: str, default_extension: str,
+                        page_numbers: Optional[Dict[str, int]] = None) -> dict:
     tmp_dir = resolve_tmp_dir(request_json)
 
     files = []
@@ -115,14 +117,15 @@ def build_disk_response(request_json: dict, output_paths: List[str], default_typ
                 # move, not copy: the work dir is removed after the response is built
                 shutil.move(output_path, target_path)
 
-        files.append(
-            {
-                "path": callback_name,
-                "label": safe_name,
-                "type": default_type,
-                "extension": default_extension,
-            }
-        )
+        entry = {
+            "path": callback_name,
+            "label": safe_name,
+            "type": default_type,
+            "extension": default_extension,
+        }
+        if page_numbers and output_path in page_numbers:
+            entry["page_number"] = page_numbers[output_path]
+        files.append(entry)
 
     return {
         "task": request_json.get('task', {}).get('id'),
@@ -219,9 +222,40 @@ def fix_broken_pdf(input_path):
         raise
 
 
-def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
-    """One single-page PDF per page. A page that cannot be written is skipped and listed in
-    failed_pages; when no page can be written the split fails."""
+class PageRangeError(ValueError):
+    """The page range typed by the user is not valid."""
+
+
+def parse_page_range(text: Any) -> Optional[List[Tuple[int, int]]]:
+    """'1-5,8,10-' -> [(1, 5), (8, 8), (10, inf)]; None (all pages) for an empty text. Pages are 1-based and
+    inclusive. Same grammar as the backend (src/shared/page-range.ts)."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    ranges: List[Tuple[int, int]] = []
+    for part in raw.split(","):
+        item = part.strip()
+        match = re.fullmatch(r"(\d+)?\s*(-)?\s*(\d+)?", item)
+        if not item or not match or (not match.group(1) and not match.group(3)):
+            raise PageRangeError(f'Invalid page range "{item}". Use for example 1-5,8,10-')
+        first = int(match.group(1)) if match.group(1) else 1
+        last = (int(match.group(3)) if match.group(3) else float("inf")) if match.group(2) else first
+        if first < 1 or last < first:
+            raise PageRangeError(f'Invalid page range "{item}". Pages start from 1 and a range goes upwards')
+        ranges.append((first, last))
+    return ranges
+
+
+def page_selected(ranges: Optional[List[Tuple[int, int]]], page: int) -> bool:
+    return ranges is None or any(first <= page <= last for first, last in ranges)
+
+
+def split_pdf_to_pages(input_file: str, output_dir: str, page_range: Optional[List[Tuple[int, int]]] = None,
+                       allow_no_selected: bool = False) -> Dict[str, Any]:
+    """One single-page PDF per selected page (all pages without a range), named after the page number in
+    the PDF. A page that cannot be written is skipped and listed in failed_pages; when no page can be
+    written the split fails. A range that matches none of the pages fails too, unless allow_no_selected
+    (a set run, where a short PDF just gives no pages)."""
     temp_file = None
     os.makedirs(output_dir, exist_ok=True)
 
@@ -242,10 +276,15 @@ def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
         except Exception:
             metadata = {}
 
+        selected = [i for i in range(1, page_count + 1) if page_selected(page_range, i)]
+        if page_count and not selected and not allow_no_selected:
+            raise PageSplitError(f"The PDF has {page_count} pages; the page range matches none of them")
+
         page_paths: List[str] = []
+        page_numbers: Dict[str, int] = {}
         failed_pages: List[Dict[str, Any]] = []
         pad_width = max(3, len(str(page_count)))
-        for i in range(1, page_count + 1):
+        for i in selected:
             try:
                 writer = PdfWriter()
                 writer.add_page(reader.pages[i - 1])
@@ -255,20 +294,23 @@ def split_pdf_to_pages(input_file: str, output_dir: str) -> Dict[str, Any]:
                 with open(output_path, "wb") as f:
                     writer.write(f)
                 page_paths.append(output_path)
+                page_numbers[output_path] = i
             except Exception as err:
                 log_event("warning", "pdf_page_write_failed", page=i, error=str(err))
                 failed_pages.append({"page": i, "error": str(err)[:300]})
 
-        if page_count and not page_paths:
-            raise PageSplitError(f"None of the {page_count} pages could be split: {failed_pages[0]['error']}")
+        if selected and not page_paths:
+            raise PageSplitError(f"None of the {len(selected)} pages could be split: {failed_pages[0]['error']}")
         if not page_count:
             raise PageSplitError("The PDF has no pages")
 
         return {
             "page_count": page_count,
+            "selected_pages": len(selected),
             "successful_pages": len(page_paths),
             "failed_pages": failed_pages,
             "page_paths": page_paths,
+            "page_numbers": page_numbers,
         }
     finally:
         if temp_file and os.path.exists(temp_file):
@@ -304,15 +346,15 @@ async def help_markdown():
     except RuntimeError as err:
         raise HTTPException(404, str(err))
 
-def build_http_response(output_id: str, output_paths: List[str]) -> dict:
-    """HTTP mode: a list of plain uris, so the elg adapter keeps each file name as the label and
-    types it by extension, as the disk response does."""
-    return {
-        "response": {
-            "type": "stored",
-            "uri": [f"/files/{output_id}/{os.path.basename(p)}" for p in output_paths],
-        },
-    }
+def build_http_response(output_id: str, output_paths: List[str], page_numbers: Optional[Dict[str, int]] = None) -> dict:
+    """HTTP mode: one uri per file, so the elg adapter keeps each file name as the label and
+    types it by extension, as the disk response does. A page is sent as {uri, page_number}."""
+    uris: List[Any] = []
+    for path in output_paths:
+        uri = f"/files/{output_id}/{os.path.basename(path)}"
+        number = (page_numbers or {}).get(path)
+        uris.append({"uri": uri, "page_number": number} if number else uri)
+    return {"response": {"type": "stored", "uri": uris}}
 
 
 def sweep_stale_outputs():
@@ -399,7 +441,14 @@ async def process_files(
 
         if task_id != 'split':
             raise HTTPException(400, f"Unsupported task: {task_id} (this service only splits PDFs)")
-        result = await run_in_threadpool(split_pdf_to_pages, input_file, work_dir)
+        params = task.get('params') if isinstance(task, dict) and isinstance(task.get('params'), dict) else {}
+        try:
+            page_range = parse_page_range(params.get('pages'))
+        except PageRangeError as err:
+            raise HTTPException(400, str(err))
+        # in a set run one PDF shorter than the range must not fail the job: it gives no pages
+        in_set_run = bool(request_json.get('set_process'))
+        result = await run_in_threadpool(split_pdf_to_pages, input_file, work_dir, page_range, in_set_run)
         output_paths = result["page_paths"]
 
         log_event(
@@ -412,18 +461,21 @@ async def process_files(
         )
         if http_mode:
             served = []
+            served_numbers = {}
             for output_path in output_paths:
                 target = OUTPUT_FOLDER / output_id / os.path.basename(output_path)
                 shutil.move(output_path, str(target))
                 served.append(str(target))
+                served_numbers[str(target)] = result["page_numbers"][output_path]
             os.unlink(input_file)
-            response = build_http_response(output_id, served)
+            response = build_http_response(output_id, served, served_numbers)
             served_ok = True
         else:
-            response = build_disk_response(request_json, output_paths, "pdf", "pdf")
+            response = build_disk_response(request_json, output_paths, "pdf", "pdf", result["page_numbers"])
         # inside "response", so that the consumer passes them on to MessyDesk with every page
         response["response"]["page_count"] = result["page_count"]
         response["response"]["failed_pages"] = result["failed_pages"]
+        response["response"]["selected_pages"] = result["selected_pages"]
         return response
     except HTTPException:
         raise

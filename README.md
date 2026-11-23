@@ -9,14 +9,22 @@ It reads and writes directly under MessyDesk file storage (`_fs`).
 
 ## Task
 
-- `split`: splits a PDF into one-page PDF files `page_NNN.pdf`. MessyDesk runs it on every PDF
-  it imports (role `import`); it is not offered as a cruncher (category `system`). Text and
-  images of the pages come from MD-poppler.
+- `split`: splits a PDF (file type `original-pdf`) into one-page PDF files `page_NNN.pdf`, named
+  after the page number in the PDF. It is a normal cruncher task. Text and images of the pages
+  come from MD-poppler, which only takes the pages (file type `pdf`).
 
-Each page keeps the document's metadata (title, author, dates), since the original PDF is removed
-after the import. A page that cannot be written is skipped; the answer lists it in
-`response.failed_pages` (`[{page, error}]`, with `response.page_count`), which MessyDesk shows on
-the import process. When no page can be written the job fails with status 422 and the reason.
+Task params:
+
+- `pages`: page range, e.g. `1-5,8,10-` (`N`, `N-M`, `N-` and `-M`, 1-based, comma separated).
+  Empty means all pages. A bad range gives status 400; a range that matches no page gives 422,
+  except in a set run (`set_process` in the message), where such a PDF gives no pages and no error.
+- `delete_original`: handled by MessyDesk after the split (default on), not by this service.
+
+Each page keeps the document's metadata (title, author, dates), since the original PDF is
+usually removed after the split. Every file of the answer has its `page_number`. A page that
+cannot be written is skipped; the answer lists it in `response.failed_pages` (`[{page, error}]`,
+with `response.page_count` and `response.selected_pages`), which MessyDesk shows on the split
+process. When no page can be written the job fails with status 422 and the reason.
 
 Outputs are written to MessyDesk's `data/<db>/tmp/`, from where MessyDesk moves them into the
 project (disk mode), or served from `/files` (HTTP mode).
